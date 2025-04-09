@@ -1,0 +1,693 @@
+s = "Python"
+print(s[1:4])  # "yth"
+print(s[:4])   # "Pyth"
+
+print(s[1::])
+class A:
+    def show(self):
+        print("Class A")
+
+class B(A):
+    def show(self):
+        print("Class B")
+
+class C(A):
+    def show(self):
+        print("Class C")
+
+class D(B, C):  # Multiple Inheritance
+    pass
+
+obj = D()
+obj.show()  # Output: Class B (Left-to-right order)
+
+print(obj)
+from functools import reduce
+
+nums = [1, 2, 3, 4]
+print(list(map(lambda x: x * 2, nums)))  # [2, 4, 6, 8]
+print(list(filter(lambda x: x % 2 == 0, nums)))  # [2, 4]
+  # 10
+print(reduce(lambda x, y: x + y, nums))
+from collections import Counter
+
+lst = [1, 2, 3, 1, 2, 1]
+print(Counter(lst).most_common(2))
+# Grammar Scoring Engine - Multimodal (Audio + Grammar Features)
+
+# --- Brief Report ---
+"""
+Approach:
+We build a multimodal grammar scoring engine using spoken audio input. We extract features from two modalities:
+1. Acoustic features using Wav2Vec2
+2. Transcribed text features using Whisper and NLP techniques
+
+Preprocessing Steps:
+- Audio: Resample to 16kHz, pad/truncate to 60s
+- Text: Transcribe using Whisper, extract grammar-related features (POS tags, sentence counts, etc.)
+- Normalize grammar features using StandardScaler
+
+Model Architecture:
+- Wav2Vec2 (frozen) extracts audio embeddings
+- Grammar features pass through a small feedforward network
+- Combined and fed into a regressor
+
+Evaluation:
+- Pearson Correlation on validation set
+- Early stopping to prevent overfitting
+
+Tools: PyTorch, HuggingFace Transformers, Faster-Whisper, NLTK
+"""
+
+import os
+import gc
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+import soundfile as sf
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import pearsonr
+from nltk.tokenize import word_tokenize
+from nltk import pos_tag
+from transformers import Wav2Vec2Processor, Wav2Vec2Model
+from faster_whisper import WhisperModel
+
+# --- Constants ---
+DATA_DIR = r"D:\shl-intern-hiring-assessment\dataset"
+AUDIO_DIR = os.path.join(DATA_DIR, "audios_train")
+TEST_DIR = os.path.join(DATA_DIR, "audios_test")
+SAMPLE_RATE = 16000
+MAX_LENGTH = SAMPLE_RATE * 5  # 5 seconds
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# --- Grammar Feature Extractor ---
+def extract_grammar_features(text):
+    tokens = word_tokenize(text)
+    pos_tags = pos_tag(tokens)
+    num_tokens = len(tokens)
+    num_sentences = text.count('.') + text.count('!') + text.count('?')
+    num_nouns = len([tag for _, tag in pos_tags if tag.startswith('NN')])
+    num_verbs = len([tag for _, tag in pos_tags if tag.startswith('VB')])
+    num_adjs  = len([tag for _, tag in pos_tags if tag.startswith('JJ')])
+    return np.array([num_tokens, num_sentences, num_nouns, num_verbs, num_adjs])
+
+
+# --- Dataset ---
+class GrammarMultimodalDataset(Dataset):
+    def __init__(self, df, audio_dir, processor, whisper_model, scaler=None, fit_scaler=False):
+        self.df = df.copy()
+        self.audio_dir = audio_dir
+        self.processor = processor
+        self.whisper = whisper_model
+        self.scaler = scaler
+        self.fit_scaler = fit_scaler
+        self.grammar_features = []
+        self.transcripts = []
+
+        valid_rows = []
+        for i, file in enumerate(tqdm(df["filename"], desc="Validating Audio")):
+            audio_path = os.path.join(audio_dir, file)
+            try:
+                with sf.SoundFile(audio_path) as f:
+                    pass
+                valid_rows.append(i)
+            except Exception as e:
+                print(f"[Skipping] {file}: {e}")
+
+        self.df = self.df.iloc[valid_rows].reset_index(drop=True)
+        self.df = self.df.iloc[:4].reset_index(drop=True)  # For testing only
+
+        count = 0
+        for file in tqdm(self.df["filename"], desc="Transcribing"):
+            if count >= 4:
+                break
+
+            audio_path = os.path.join(audio_dir, file)
+            print(file)
+            feats = np.zeros(5)
+            text = ""
+
+            try:
+                segments, _ = self.whisper.transcribe(audio_path, beam_size=1)
+                print(segments)
+                text = " ".join([seg.text for seg in segments])
+                print(text)
+                feats = extract_grammar_features(text)
+                print(feats)
+            except Exception as e:
+                print(f"[Skipping] {file}: {e}")
+                feats = np.zeros(5)
+                text = ""
+
+            self.grammar_features.append(feats)
+            self.transcripts.append(text)
+            del segments, feats
+            gc.collect()
+            count += 1
+
+        print(f"[Info] Extracted grammar features for {len(self.grammar_features)} out of {len(self.df)} samples.")
+        self.grammar_features = np.array(self.grammar_features)
+
+        if self.fit_scaler:
+            self.scaler = StandardScaler()
+            self.grammar_features = self.scaler.fit_transform(self.grammar_features)
+        elif self.scaler:
+            self.grammar_features = self.scaler.transform(self.grammar_features)
+
+        self.df["transcription"] = self.transcripts
+        print(self.df[["filename", "transcription"]])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        path = os.path.join(self.audio_dir, row["filename"])
+
+        try:
+            waveform, sr = torchaudio.load(path)
+            waveform = torchaudio.functional.resample(waveform.mean(0), sr, SAMPLE_RATE)
+        except Exception as e:
+            print(f"[Error loading audio {path}]: {e}")
+            waveform = torch.zeros(MAX_LENGTH)
+
+        if len(waveform) > MAX_LENGTH:
+            waveform = waveform[:MAX_LENGTH]
+        else:
+            waveform = torch.nn.functional.pad(waveform, (0, MAX_LENGTH - len(waveform)))
+
+        inputs = self.processor(waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True)
+        input_values = inputs.input_values[0]
+        attention_mask = inputs.attention_mask[0]
+        grammar_feats = torch.tensor(self.grammar_features[idx], dtype=torch.float)
+
+        if "score" in row:
+            label = torch.tensor(row["score"], dtype=torch.float)
+            return input_values, attention_mask, grammar_feats, label
+        else:
+            return input_values, attention_mask, grammar_feats
+
+
+# --- Model ---
+class MultimodalGrammarModel(nn.Module):
+    def __init__(self, grammar_dim):
+        super().__init__()
+        self.wav2vec = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+        self.dropout = nn.Dropout(0.1)
+        self.fc_audio = nn.Linear(self.wav2vec.config.hidden_size, 64)
+        self.fc_grammar = nn.Linear(grammar_dim, 32)
+        self.fc_combined = nn.Linear(96, 1)
+
+    def forward(self, input_values, attention_mask, grammar_feats):
+        with torch.no_grad():
+            outputs = self.wav2vec(input_values, attention_mask=attention_mask)
+        audio_feat = outputs.last_hidden_state.mean(dim=1)
+        audio_feat = torch.relu(self.fc_audio(self.dropout(audio_feat)))
+        grammar_feat = torch.relu(self.fc_grammar(grammar_feats))
+        combined = torch.cat([audio_feat, grammar_feat], dim=1)
+        return self.fc_combined(combined).squeeze(1)
+
+
+# --- Training ---
+def train(model, train_loader, val_loader, epochs=10, lr=1e-4, patience=3):
+    model.to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} Training"):
+            if len(batch) == 4:
+                iv, am, gf, label = batch
+                iv, am, gf, label = iv.to(DEVICE), am.to(DEVICE), gf.to(DEVICE), label.to(DEVICE)
+                optimizer.zero_grad()
+                output = model(iv, am, gf)
+                loss = criterion(output, label)
+                loss.backward()
+                optimizer.step()
+                train_losses.append(loss.item())
+
+        model.eval()
+        val_losses, preds, targets = [], [], []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                if len(batch) == 4:
+                    iv, am, gf, label = batch
+                    iv, am, gf, label = iv.to(DEVICE), am.to(DEVICE), gf.to(DEVICE), label.to(DEVICE)
+                    output = model(iv, am, gf)
+                    val_losses.append(criterion(output, label).item())
+                    preds.extend(output.cpu().numpy())
+                    targets.extend(label.cpu().numpy())
+
+        if preds and targets:
+            val_loss = np.mean(val_losses)
+            val_pearson = pearsonr(preds, targets)[0]
+            print(f"Epoch {epoch+1}: Train Loss={np.mean(train_losses):.4f}, Val Loss={val_loss:.4f}, Pearson={val_pearson:.4f}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), "best_model.pt")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print("Early stopping.")
+                    break
+
+
+# --- Main ---
+train_df = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
+val_df = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+
+whisper_model = WhisperModel("base", compute_type="int8", device="cpu")
+wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+
+train_dataset = GrammarMultimodalDataset(train_df, AUDIO_DIR, wav2vec_processor, whisper_model, fit_scaler=True)
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
+
+val_dataset = GrammarMultimodalDataset(train_df.iloc[:4], TEST_DIR, wav2vec_processor, whisper_model, scaler=train_dataset.scaler)
+val_loader = DataLoader(val_dataset, batch_size=2, num_workers=0)
+
+model = MultimodalGrammarModel(grammar_dim=5)
+train(model, train_loader, val_loader)
+
+
+# --- Inference ---
+model.load_state_dict(torch.load("best_model.pt"))
+model.eval()
+
+def assign_grammar_grade(score):
+    if score < 1.5:
+        return 1
+    elif score < 2.5:
+        return 2
+    elif score < 3.5:
+        return 3
+    elif score < 4.5:
+        return 4
+    else:
+        return 5
+
+def predict_and_save(model, test_df, test_audio_dir, processor, whisper_model, scaler):
+    model.eval()
+    test_dataset = GrammarMultimodalDataset(test_df, test_audio_dir, processor, whisper_model, scaler=scaler)
+    test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False)
+
+    predictions = []
+    with torch.no_grad():
+        for iv, am, gf in tqdm(test_loader, desc="Predicting on test set"):
+            iv, am, gf = iv.to(DEVICE), am.to(DEVICE), gf.to(DEVICE)
+            outputs = model(iv, am, gf)
+            predictions.extend(outputs.cpu().numpy())
+
+    test_df["score"] = predictions
+    test_df["grade"] = test_df["score"].apply(assign_grammar_grade)
+    return test_df
+
+def predict_and_grade(dataloader, df):
+    predictions = []
+    with torch.no_grad():
+        for iv, am, gf, _ in tqdm(dataloader, desc="Predicting"):
+            iv, am, gf = iv.to(DEVICE), am.to(DEVICE), gf.to(DEVICE)
+            output = model(iv, am, gf)
+            predictions.extend(output.cpu().numpy())
+
+    df["predicted_score"] = predictions
+    df["predicted_grade"] = df["predicted_score"].apply(assign_grammar_grade)
+    return df
+
+# Apply grading
+val_df = predict_and_grade(val_loader, val_df)
+
+print(train_df[["filename", "score", "predicted_score", "predicted_grade"]].head())
+print(val_df[["filename", "predicted_score", "predicted_grade"]].head())
+
+# Final prediction on test set
+model.load_state_dict(torch.load("best_model.pt"))
+final_val_df = predict_and_save(model, val_df, TEST_DIR, wav2vec_processor, whisper_model, train_dataset.scaler)
+
+# Save predictions
+final_val_df.to_csv("test_with_scores_and_grades.csv", index=False)
+print(final_val_df.head())
+
+import os
+import gc
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+import soundfile as sf
+from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import pearsonr
+from nltk.tokenize import word_tokenize
+from nltk import pos_tag
+from transformers import Wav2Vec2Processor, Wav2Vec2Model
+from faster_whisper import WhisperModel
+
+# --- Constants ---
+DATA_DIR = r"D:\shl-intern-hiring-assessment\dataset"
+AUDIO_DIR = os.path.join(DATA_DIR, "audios_train")
+TEST_DIR = os.path.join(DATA_DIR, "audios_test")
+SAMPLE_RATE = 16000
+MAX_LENGTH = SAMPLE_RATE * 5  # 5 seconds
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Load Data ---
+train_df = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
+train_df.rename(columns={'label': 'score'}, inplace=True)
+test_df = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+
+# --- Load Models ---
+whisper_model = WhisperModel("base", compute_type="int8", device="cpu")
+wav2vec_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+
+# --- Grammar Feature Extractor ---
+def extract_grammar_features(text):
+    tokens = word_tokenize(text)
+    pos_tags = pos_tag(tokens)
+    num_tokens = len(tokens)
+    num_sentences = text.count('.') + text.count('!') + text.count('?')
+    num_nouns = len([tag for _, tag in pos_tags if tag.startswith('NN')])
+    num_verbs = len([tag for _, tag in pos_tags if tag.startswith('VB')])
+    num_adjs  = len([tag for _, tag in pos_tags if tag.startswith('JJ')])
+    return np.array([num_tokens, num_sentences, num_nouns, num_verbs, num_adjs])
+
+# --- Dataset ---
+class GrammarMultimodalDataset(Dataset):
+    def __init__(self, df, audio_dir, processor, whisper_model, scaler=None, fit_scaler=False):
+        self.df = df.copy()
+        self.audio_dir = audio_dir
+        self.processor = processor
+        self.whisper = whisper_model
+        self.scaler = scaler
+        self.fit_scaler = fit_scaler
+        self.grammar_features = []
+        self.transcripts = []
+
+        # Initialize grammar feature columns
+        for i in range(1, 6):
+            self.df[f"grammar_feat_{i}"] = np.nan
+        self.df["transcript"] = ""
+
+        # Filter valid audio files
+        valid_rows = []
+        for i, file in enumerate(tqdm(self.df["filename"], desc="Validating Audio")):
+            audio_path = os.path.join(audio_dir, file)
+            try:
+                with sf.SoundFile(audio_path) as f:
+                    pass
+                valid_rows.append(i)
+            except Exception as e:
+                print(f"[Skipping] {file}: {e}")
+
+        self.df = self.df.iloc[valid_rows].reset_index(drop=True)
+        # self.df = self.df.iloc[:4].reset_index(drop=True)  # Optional: limit to 4 for speed
+
+        for idx, file in enumerate(tqdm(self.df["filename"], desc="Transcribing")):
+            audio_path = os.path.join(audio_dir, file)
+            print(f"[Processing] {file}")
+
+            feats = np.zeros(5)
+            text = ""
+
+            try:
+                segments, _ = self.whisper.transcribe(audio_path, beam_size=1)
+                if segments:
+                    text = " ".join([seg.text for seg in segments])
+                    feats = extract_grammar_features(text)
+            except Exception as e:
+                print(f"[Skipping] {file}: {e}")
+
+            self.df.loc[idx, "transcript"] = text
+            for j, feat in enumerate(feats):
+                self.df.loc[idx, f"grammar_feat_{j+1}"] = feat
+
+            self.grammar_features.append(feats)
+            self.transcripts.append(text)
+
+            del feats
+            gc.collect()
+
+        print(f"[Info] Extracted grammar features for {len(self.grammar_features)} samples.")
+
+        if len(self.grammar_features) > 0:
+            self.grammar_features = np.array(self.grammar_features)
+            if self.fit_scaler:
+                self.scaler = StandardScaler()
+                self.grammar_features = self.scaler.fit_transform(self.grammar_features)
+            elif self.scaler:
+                self.grammar_features = self.scaler.transform(self.grammar_features)
+        else:
+            self.grammar_features = np.zeros((len(self.df), 5))  # fallback to zero features
+
+        self.df["transcription"] = self.transcripts
+        print(self.df[["filename", "transcription"]])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        path = os.path.join(self.audio_dir, row["filename"])
+
+        try:
+            waveform, sr = torchaudio.load(path)
+            waveform = torchaudio.functional.resample(waveform.mean(0), sr, SAMPLE_RATE)
+        except Exception as e:
+            print(f"[Error loading audio {path}]: {e}")
+            waveform = torch.zeros(MAX_LENGTH)
+
+        if len(waveform) > MAX_LENGTH:
+            waveform = waveform[:MAX_LENGTH]
+        else:
+            waveform = torch.nn.functional.pad(waveform, (0, MAX_LENGTH - len(waveform)))
+
+        inputs = self.processor(waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True)
+        input_values = inputs.input_values[0]
+        attention_mask = inputs.attention_mask[0]
+        grammar_feats = torch.tensor(self.grammar_features[idx], dtype=torch.float)
+
+        if "score" in row:
+            label = torch.tensor(row["score"], dtype=torch.float)
+            return input_values, attention_mask, grammar_feats, label
+        else:
+            return input_values, attention_mask, grammar_feats
+
+# --- Create Dataset & DataLoader ---
+train_dataset = GrammarMultimodalDataset(train_df, AUDIO_DIR, wav2vec_processor, whisper_model, fit_scaler=True)
+test_dataset = GrammarMultimodalDataset(test_df, TEST_DIR, wav2vec_processor, whisper_model, scaler=train_dataset.scaler)
+
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0)
+test_loader = DataLoader(test_dataset, batch_size=2, shuffle=False, num_workers=0)
+
+# --- Model ---
+class MultimodalGrammarModel(nn.Module):
+    def __init__(self, grammar_dim):
+        super().__init__()
+        self.wav2vec = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+        self.dropout = nn.Dropout(0.1)
+        self.fc_audio = nn.Linear(self.wav2vec.config.hidden_size, 64)
+        self.fc_grammar = nn.Linear(grammar_dim, 32)
+        self.fc_combined = nn.Linear(96, 1)
+
+    def forward(self, input_values, attention_mask, grammar_feats):
+        with torch.no_grad():
+            outputs = self.wav2vec(input_values, attention_mask=attention_mask)
+        audio_feat = outputs.last_hidden_state.mean(dim=1)
+        audio_feat = torch.relu(self.fc_audio(self.dropout(audio_feat)))
+        grammar_feat = torch.relu(self.fc_grammar(grammar_feats))
+        combined = torch.cat([audio_feat, grammar_feat], dim=1)
+        return self.fc_combined(combined).squeeze(1)
+
+
+# --- Training ---
+def train(model, train_loader, epochs=18, lr=1e-4):
+    model.to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} Training"):
+            if len(batch) == 4:
+                iv, am, gf, label = batch
+                iv, am, gf, label = iv.to(DEVICE), am.to(DEVICE), gf.to(DEVICE), label.to(DEVICE)
+
+                optimizer.zero_grad()
+                output = model(iv, am, gf)
+                loss = criterion(output, label)
+                loss.backward()
+                optimizer.step()
+
+                train_losses.append(loss.item())
+
+        print(f"Epoch {epoch+1}: Train Loss = {np.mean(train_losses):.4f}")
+
+    # ✅ Save model manually
+    torch.save(model.state_dict(), "final_model.pt")
+    print("✅ Final model saved to final_model.pt")
+
+
+# --- Main ---
+
+model = MultimodalGrammarModel(grammar_dim=5)
+train(model, train_loader)
+
+
+import torch
+import torch.nn as nn
+from transformers import Wav2Vec2Model
+from tqdm import tqdm
+import pandas as pd
+import os
+os.chdir(r"D:\shl-intern-hiring-assessment\dataset")
+
+# --- Model Definition ---
+class MultimodalGrammarModel(nn.Module):
+    def __init__(self, grammar_dim):
+        super().__init__()
+        self.wav2vec = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h")
+        self.dropout = nn.Dropout(0.1)
+        self.fc_audio = nn.Linear(self.wav2vec.config.hidden_size, 64)
+        self.fc_grammar = nn.Linear(grammar_dim, 32)
+        self.fc_combined = nn.Linear(96, 1)
+
+    def forward(self, input_values, attention_mask, grammar_feats):
+        with torch.no_grad():  # freeze wav2vec
+            outputs = self.wav2vec(input_values, attention_mask=attention_mask)
+        audio_feat = outputs.last_hidden_state.mean(dim=1)
+        audio_feat = torch.relu(self.fc_audio(self.dropout(audio_feat)))
+        grammar_feat = torch.relu(self.fc_grammar(grammar_feats))
+        combined = torch.cat([audio_feat, grammar_feat], dim=1)
+        return self.fc_combined(combined).squeeze(1)
+
+# --- Load Model ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = MultimodalGrammarModel(grammar_dim=5)
+model.load_state_dict(torch.load("final_model.pt", map_location=DEVICE))
+model.to(DEVICE)
+model.eval()
+
+# --- Prediction ---
+predictions = []
+filenames = []
+
+with torch.no_grad():
+    for i in tqdm(range(len(test_dataset)), desc="Predicting"):
+        iv, am, gf = test_dataset[i]  # ✅ FIXED: Only 3 items returned
+        iv = iv.unsqueeze(0).to(DEVICE)          # add batch dim
+        am = am.unsqueeze(0).to(DEVICE)
+        gf = gf.unsqueeze(0).to(DEVICE)
+
+        output = model(iv, am, gf)
+        predictions.append(output.item())
+
+        # Get filename from dataset df
+        filename = test_dataset.df.iloc[i]['filename']
+        filenames.append(filename)
+
+# --- Save Predictions to CSV ---
+df_preds = pd.DataFrame({
+    "filename": filenames,
+    "predicted_score": predictions
+})
+df_preds.to_csv("predicted_scores.csv", index=False)
+print("✅ Saved predictions to predicted_scores.csv")
+print(df_preds.head())
+
+
+
+
+import pandas as pd
+
+# Define your grade assignment function
+def assign_grammar_grade(score):
+    if score < 1.45:
+        return 1
+    elif score < 2.45:
+        return 2
+    elif score < 3.45:
+        return 3
+    elif score < 4.45:
+        return 4
+    else:
+        return 5
+
+# Load your predictions CSV
+df = pd.read_csv("predicted_scores.csv")
+
+# Apply grading
+df["predicted_grade"] = df["predicted_score"].apply(assign_grammar_grade)
+
+
+# Drop predicted_score column
+df = df.drop(columns=["predicted_score"])
+
+# Rename predicted_grade to score
+df = df.rename(columns={"predicted_grade": "label"})
+
+# Save final output
+df.to_csv("newfinal_predictions.csv", index=False)
+
+# Show sample
+print(df.head())
+
+
+
+
+test_dataset.df[["filename","transcript", "grammar_feat_1", "grammar_feat_2", "grammar_feat_3"]]
+data.rename(columns={'label': 'score'}, inplace=True)
+data
+data
+data["new column"] = 1
+data
+data = data.drop('new column', axis=1)
+data
+data = data.drop(index=0)
+data
+print(data.columns)
+
+
+df.columns.tolist()
+# Plot curves
+import matplotlib.pyplot as plt
+plt.plot(train_losses_all, label="Train Loss")
+plt.plot(val_losses_all, label="Val Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Loss Curve")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.plot(pearsons, label="Pearson")
+plt.xlabel("Epoch")
+plt.ylabel("Correlation")
+plt.title("Validation Pearson")
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(6,6))
+plt.scatter(targets, preds, alpha=0.6)
+plt.plot([0, 5], [0, 5], '--r')
+plt.xlabel("True Score")
+plt.ylabel("Predicted Score")
+plt.title("Predicted vs Actual")
+plt.grid(True)
+plt.show()
+
